@@ -6,6 +6,7 @@ package database
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"strings"
 
 	"github.com/Azure/ARO-RP/pkg/api"
@@ -21,7 +22,9 @@ type Billing interface {
 	Create(context.Context, *api.BillingDocument) (*api.BillingDocument, error)
 	Get(context.Context, string) (*api.BillingDocument, error)
 	MarkForDeletion(context.Context, string) (*api.BillingDocument, error)
-	UpdateLastBillingTimestamp(context.Context, string, int) (*api.BillingDocument, error)
+	// UpdateLastBillingTimestamp uses the caller's observed ETag and returns
+	// precondition failures without retrying the timestamp against a newer version.
+	UpdateLastBillingTimestamp(ctx context.Context, id, expectedETag string, timestamp int) (*api.BillingDocument, error)
 	List(string) cosmosdb.BillingDocumentIterator
 	ListAll(context.Context) (*api.BillingDocuments, error)
 	Delete(context.Context, *api.BillingDocument) error
@@ -106,12 +109,34 @@ func (c *billing) Delete(ctx context.Context, doc *api.BillingDocument) error {
 	return c.c.Delete(ctx, doc.ID, doc, &cosmosdb.Options{NoETag: true})
 }
 
-// UpdateLastBillingTimestamp update the last billing timestamp field in the document with the time provided
-// This time will be provided by the billing service so we don't need to use trigger
-func (c *billing) UpdateLastBillingTimestamp(ctx context.Context, id string, time int) (*api.BillingDocument, error) {
-	// Passing non-nil Options with NoETag=false makes Replace send If-Match, enabling the patch retry loop's ETag concurrency
-	return c.patch(ctx, id, func(billingdoc *api.BillingDocument) error {
-		billingdoc.Billing.LastBillingTime = time
-		return nil
-	}, &cosmosdb.Options{NoETag: false})
+func (c *billing) UpdateLastBillingTimestamp(ctx context.Context, id, expectedETag string, timestamp int) (*api.BillingDocument, error) {
+	if expectedETag == "" {
+		return nil, cosmosdb.ErrETagRequired
+	}
+	if expectedETag == "*" {
+		return nil, fmt.Errorf("billing watermark update requires a specific ETag")
+	}
+
+	doc, err := c.Get(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if doc == nil || doc.Billing == nil {
+		return nil, fmt.Errorf("billing document %q is missing billing data", id)
+	}
+	if doc.ETag != expectedETag {
+		return nil, &cosmosdb.Error{
+			StatusCode: http.StatusPreconditionFailed,
+			Message:    fmt.Sprintf("billing document %q changed since it was read", id),
+		}
+	}
+
+	// Preserve RP-owned and unknown fields without modifying the read snapshot.
+	proposedBilling := *doc.Billing
+	proposedBilling.LastBillingTime = timestamp
+	proposedDoc := *doc
+	proposedDoc.Billing = &proposedBilling
+
+	// The matching read does not protect against a writer racing this replacement.
+	return c.c.Replace(ctx, id, &proposedDoc, &cosmosdb.Options{NoETag: false})
 }
